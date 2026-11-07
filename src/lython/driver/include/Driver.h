@@ -34,6 +34,11 @@ struct DriverOptions {
   // A WASI program linked to run under a JavaScript host (`--js-host`): it
   // may import `js`, and the host's loader runs it.
   bool jsHost = false;
+  // The package `__main__` belongs to when the program runs as a module
+  // (`lyc -m pkg.mod`, CPython's `python -m`). CPython imports it before
+  // `__main__` runs, and relative imports start from it. Empty for a script,
+  // whose package follows from the `__init__.py` files around it.
+  std::string mainPackage;
 };
 
 // Whether the program has a JavaScript host on `triple`: WASI, when it was
@@ -49,8 +54,10 @@ parseModuleFromBuffer(llvm::StringRef buffer, mlir::MLIRContext &context,
                       llvm::raw_ostream &diag);
 
 // Frontend: parse -> local/embedded import resolution -> py dialect emission.
-// importBaseDir is the search base for local source imports; a nonexistent
-// directory restricts resolution to the embedded stdlib.
+// importBaseDir is where every module's absolute imports are looked for
+// (CPython's sys.path[0]: the script's directory, or a project's import
+// root); relative imports start from the importing file's own directory. A
+// nonexistent directory restricts absolute resolution to the embedded stdlib.
 mlir::LogicalResult
 emitMLIRFromSource(llvm::StringRef source, llvm::StringRef sourcePath,
                    llvm::StringRef importBaseDir, const DriverOptions &options,

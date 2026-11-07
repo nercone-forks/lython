@@ -258,10 +258,12 @@ add_library(LythonDriver STATIC
     lib/Compile.cpp
     lib/Frontend.cpp
     lib/LLVMFinalize.cpp
+    lib/Project.cpp
     lib/Registry.cpp
     lib/SafetyMetadata.cpp
     lib/SanitizerSupport.cpp
     lib/TargetConfig.cpp
+    ../common/TOML.cpp
     "${LYTHON_EMBEDDED_LIB_INTERNAL_CPP}"
     "${LYTHON_EMBEDDED_STDLIB_CPP}"
 )
@@ -273,6 +275,7 @@ add_dependencies(LythonDriver PyDialectIncGen)
 target_include_directories(LythonDriver
     PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/lython/common
     ${CMAKE_SOURCE_DIR}/src/lython/dialects
     ${CMAKE_BINARY_DIR}/src/lython/dialects
     ${CMAKE_SOURCE_DIR}/src/lython/lowering

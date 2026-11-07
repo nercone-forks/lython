@@ -1,0 +1,11 @@
+# A flat-layout project: no src/, so the import root is this directory.
+[project]
+name = "tool"
+version = "0.1"
+
+[project.scripts]
+tool = "tool.app:run"
+tool-cls = "tool.app:App.start"
+
+[project.gui-scripts]
+tool-gui = "tool.app:run [gui]"

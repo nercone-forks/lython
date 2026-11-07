@@ -1,0 +1,9 @@
+# A src-layout project: the import root is src/, which an install would put
+# on sys.path.
+[project]
+name = "mylib"
+version = "0.1.0"
+requires-python = ">=3.14"
+
+[project.scripts]
+mylib = "mylib.cli:main"

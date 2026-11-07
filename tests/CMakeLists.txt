@@ -26,6 +26,8 @@
 #             into `emit` would make the taxonomy's own claim ("cut by how far
 #             into the compiler a test reaches") false for its members.
 #     tables  generated Unicode tables checked against CPython; no compilation
+#     project reading a project directory: its pyproject.toml (the TOML reader),
+#             its entry points and the module `-m` runs; no compilation
 #     meta    the suite checking itself; no compilation
 #     lower   a full lowering to verified LLVM IR, no JIT and no execution
 #     e2e     `lyc jit` in a subprocess: compile, link, and run the program
@@ -39,7 +41,8 @@
 #             does not move it. Separate from `slow` on purpose: merged, a
 #             compiler fix would look like it had not worked
 #
-#   Suite labels: unit, golden, golden-cases, golden-errors, examples, leak,
+#   Suite labels: unit, golden, golden-cases, golden-errors, examples,
+#                 project-dirs, leak,
 #                 aot, release, wasm, wasi, js
 #
 #   `aot`, `release` and `wasm` are agreement stages: the same cases and the
@@ -102,6 +105,7 @@ add_executable(lython_unit_tests
     unit/ModelCorrespondenceTests.cpp
     unit/SoleProducerTests.cpp
     unit/ParserTests.cpp
+    unit/ProjectTests.cpp
     unit/RuntimeLoopExitTests.cpp
     unit/RuntimeRaisePathTests.cpp
     unit/TypeInferenceTests.cpp
@@ -161,7 +165,7 @@ endif()
 # `lower` is spelled out test by test rather than as `DriverTest.*` minus two, so
 # that a newly added DriverTest matches no pattern and LayerManifestTest says so
 # by name instead of the test silently never running.
-set(LYTHON_UNIT_LAYERS parse emit abi tables meta lower)
+set(LYTHON_UNIT_LAYERS parse emit abi tables project meta lower)
 
 set(LYTHON_UNIT_PATTERNS_parse
     "ParserTest.*"
@@ -171,6 +175,7 @@ set(LYTHON_UNIT_PATTERNS_emit
     "EvidenceVerifierTest.*"
     "TypeSystemTest.*"
     "TypeInferenceTest.*"
+    "ImportPathTest.*"
     "DriverTest.ReportsEmitErrorDiagnostics")
 set(LYTHON_UNIT_PATTERNS_abi
     "EntityHeaderPrefixTest.*"
@@ -187,6 +192,10 @@ set(LYTHON_UNIT_PATTERNS_abi
 # checking the tree rather than the compiler.
 set(LYTHON_UNIT_PATTERNS_tables
     "UnicodeTablesTest.*")
+set(LYTHON_UNIT_PATTERNS_project
+    "TOMLTest.*"
+    "EntryPointTest.*"
+    "ProjectTest.*")
 set(LYTHON_UNIT_PATTERNS_meta
     "LayerManifestTest.*"
     "ModelCorrespondenceTest.*"
@@ -295,6 +304,7 @@ set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")
 set(LYTHON_UNIT_LABELS_abi    "abi;unit;fast")
 set(LYTHON_UNIT_LABELS_tables "tables;unit;fast")
+set(LYTHON_UNIT_LABELS_project "project;unit;fast")
 set(LYTHON_UNIT_LABELS_meta   "meta;unit;fast")
 set(LYTHON_UNIT_LABELS_lower  "lower;unit")
 
@@ -475,6 +485,47 @@ function(lython_add_golden_case dir case_path case_timeout)
         TIMEOUT ${case_outer_timeout}
         LABELS "${case_labels}")
 endfunction()
+
+# --- Project directories ----------------------------------------------------
+# `lyc jit <dir>` on a directory with a pyproject.toml, run the way each case
+# names, against tests/projects/<case>.* sidecars. The stdout and exit codes
+# were written by CPython 3.14 running the same project as installed: the
+# script's entry point imported from the import root, and `-m` from there.
+# A case that is refused before anything compiles is in the `project` layer
+# (reading the project directory) and costs what the CLI's startup costs.
+function(lython_add_project_case case_name project layer)
+    set(project_options)
+    foreach(option IN LISTS ARGN)
+        list(APPEND project_options "--lyc-option=${option}")
+    endforeach()
+    add_test(NAME "projects.${case_name}"
+        COMMAND Python3::Interpreter "${LYTHON_GOLDEN_RUNNER}"
+            --lyc $<TARGET_FILE:lyc> --timeout 300
+            --expect "${CMAKE_CURRENT_SOURCE_DIR}/projects/${case_name}"
+            ${project_options}
+            "${CMAKE_CURRENT_SOURCE_DIR}/projects/${project}")
+    # Not `projects`: ctest -L takes a regex, and it would put every one of
+    # these under the `project` stage label.
+    set(project_labels "${layer}" project-dirs)
+    if(NOT layer STREQUAL "e2e")
+        list(APPEND project_labels fast)
+    endif()
+    set_tests_properties("projects.${case_name}" PROPERTIES
+        TIMEOUT 360
+        LABELS "${project_labels}")
+endfunction()
+
+lython_add_project_case(src_layout_script src_layout e2e)
+lython_add_project_case(src_layout_module src_layout e2e -m mylib)
+lython_add_project_case(src_layout_submodule src_layout e2e -m mylib.report)
+lython_add_project_case(src_layout_no_such_module src_layout project -m nope)
+lython_add_project_case(src_layout_package_without_main src_layout project
+    -m mylib.sub)
+lython_add_project_case(flat_layout_named_script flat_layout e2e
+    --script tool-cls)
+lython_add_project_case(flat_layout_gui_script flat_layout e2e
+    --script tool-gui)
+lython_add_project_case(flat_layout_needs_a_choice flat_layout project)
 
 file(GLOB LYTHON_GOLDEN_CASES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/*.py")
