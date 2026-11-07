@@ -31,6 +31,11 @@ running under -j8 in one directory is a race.
 --timeout S bounds the lyc run; exceeding it is reported as its own failure
 reason rather than as differing output.
 
+--lyc-option OPT (repeatable) passes OPT to `lyc jit` before the case, and
+--expect STEM reads the sidecars from STEM.* instead of from beside the case:
+together they run a project directory (tests/projects) the way a case names,
+which has no file of its own to put the sidecars next to.
+
 --expect-layer L asserts which pipeline stage the case reaches. The stage comes
 from the compiler's own PerfScope trace rather than from the diagnostic text, so
 a case that stops being rejected by the frontend and starts being rejected by
@@ -166,7 +171,8 @@ def run_aot(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
 
 def run_lyc(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
             perf: bool, aot: bool = False, release: bool = False,
-            cross: "CrossRun | None" = None, goal: "str | None" = None
+            cross: "CrossRun | None" = None, goal: "str | None" = None,
+            options: "list[str] | None" = None
             ) -> "subprocess.CompletedProcess[str] | None":
     env = dict(os.environ)
     if perf:
@@ -187,6 +193,7 @@ def run_lyc(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
         command = [str(lyc), "jit"]
         if release:
             command.append("--release")
+        command.extend(options or [])
         command.append(str(case))
         return subprocess.run(command, capture_output=True, text=True,
                               timeout=timeout, env=env,
@@ -227,14 +234,15 @@ def fail(message: str, stdout: str, stderr: str, where: str = "") -> int:
 def report_reached_layer(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
                          aot: bool = False, release: bool = False,
                          cross: "CrossRun | None" = None,
-                         goal: "str | None" = None) -> None:
+                         goal: "str | None" = None,
+                         options: "list[str] | None" = None) -> None:
     """Say which stage the compiler reached, so a red test localizes itself.
 
     The re-run repeats the MODE as well as the case: a JIT re-run of an --aot
     failure would report a stage the failing run never went through.
     """
     result = run_lyc(lyc, case, timeout, perf=True, aot=aot, release=release,
-                     cross=cross, goal=goal)
+                     cross=cross, goal=goal, options=options)
     if result is None:
         print("--- reached layer: unknown, the LYTHON_PERF re-run timed out",
               file=sys.stderr)
@@ -265,9 +273,14 @@ def main() -> int:
     parser.add_argument("--goal", choices=["O2", "Os", "Oz"], default=None)
     parser.add_argument("--wasm-node", type=pathlib.Path, default=None)
     parser.add_argument("--wasmtime", type=pathlib.Path, default=None)
+    parser.add_argument("--lyc-option", action="append", default=[])
+    parser.add_argument("--expect", type=pathlib.Path, default=None)
     parser.add_argument("case", type=pathlib.Path)
     args = parser.parse_args()
     cross = cross_run_from(args)
+    if args.lyc_option and (args.aot or args.goal is not None or cross):
+        parser.error("--lyc-option is only passed to `lyc jit`")
+    expect = args.expect or args.case
 
     # Why not let TimeoutExpired propagate: an uncaught traceback exits
     # nonzero, so ctest labels the run "Failed" exactly like a wrong-output
@@ -275,7 +288,8 @@ def main() -> int:
     result = run_lyc(args.lyc, args.case, args.timeout,
                      perf=args.expect_layer is not None,
                      aot=args.aot or args.goal is not None,
-                     release=args.release, cross=cross, goal=args.goal)
+                     release=args.release, cross=cross, goal=args.goal,
+                     options=args.lyc_option)
     if result is None:
         # Why no layer report here: the re-run would spend the same budget
         # over again and end the same way.
@@ -296,7 +310,7 @@ def main() -> int:
             report_reached_layer(args.lyc, args.case, args.timeout,
                                  aot=args.aot or args.goal is not None,
                                  release=args.release, cross=cross,
-                                 goal=args.goal)
+                                 goal=args.goal, options=args.lyc_option)
         else:
             print(f"--- reached layer: {reached}", file=sys.stderr)
         return code
@@ -308,21 +322,21 @@ def main() -> int:
         return 0
 
     expected_exit = 0
-    exitcode_file = args.case.with_suffix(".exitcode")
+    exitcode_file = expect.with_suffix(".exitcode")
     if exitcode_file.exists():
         expected_exit = int(exitcode_file.read_text().strip())
     if result.returncode != expected_exit:
         return failed(f"exit code {result.returncode}, "
                       f"expected {expected_exit}")
 
-    stdout_file = args.case.with_suffix(".stdout")
+    stdout_file = expect.with_suffix(".stdout")
     if stdout_file.exists():
         expected_stdout = stdout_file.read_text()
         if stdout != expected_stdout:
             return failed("stdout differs from expected",
                           first_difference(stdout, expected_stdout))
 
-    stderr_re_file = args.case.with_suffix(".stderr-re")
+    stderr_re_file = expect.with_suffix(".stderr-re")
     if stderr_re_file.exists():
         pattern = stderr_re_file.read_text().strip()
         if not re.search(pattern, stderr):

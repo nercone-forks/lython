@@ -482,8 +482,17 @@ static void appendDottedImportSourceRequests(
                            requestedModules);
 }
 
+// `importRoot` is where absolute imports are looked for -- CPython's sys.path,
+// which is the same for every module of the program -- and `baseDir` is the
+// directory of the module doing the importing, which only relative imports
+// start from.
+// ⛔ Absolute imports used to start from `baseDir` too, so `import b` in
+// pkg/a.py found pkg/b.py (Python 2's implicit relative import) and
+// `import pkg.b` in it looked for pkg/pkg/b.py: a package could not import
+// its own modules by their full names, which is how a project's modules
+// import each other.
 static void collectImportedModuleRequests(
-    const lython::parser::Node &module, StringRef baseDir,
+    const lython::parser::Node &module, StringRef importRoot, StringRef baseDir,
     StringRef packageName, const llvm::Triple &triple, bool hasJsHost,
     llvm::SmallVectorImpl<SourceImportRequest> &requests) {
   std::set<std::string> requestedModules;
@@ -537,7 +546,7 @@ static void collectImportedModuleRequests(
         if (!alias)
           continue;
         if (std::optional<std::string> name = stringField(*alias, "name"))
-          appendDottedImportSourceRequests(requests, baseDir, *name,
+          appendDottedImportSourceRequests(requests, importRoot, *name,
                                            &requestedModules);
       }
       continue;
@@ -552,7 +561,7 @@ static void collectImportedModuleRequests(
           // of `os`, so os.py has to be compiled for anything to resolve `path`
           // -- and asking only for "os.path", which names no source, asked for
           // nothing at all.
-          appendDottedImportSourceRequests(requests, baseDir, *moduleName,
+          appendDottedImportSourceRequests(requests, importRoot, *moduleName,
                                            &requestedModules);
           const auto *aliases = nodeListField(*statement, "names");
           if (!aliases)
@@ -564,7 +573,8 @@ static void collectImportedModuleRequests(
             if (!name || *name == "*")
               continue;
             std::string submodule = joinModuleName(*moduleName, *name);
-            appendIfLocal(submodule, localSourceModulePath(baseDir, submodule));
+            appendIfLocal(submodule,
+                          localSourceModulePath(importRoot, submodule));
           }
         }
         continue;
@@ -630,7 +640,8 @@ struct ParsedLocalSourceModule {
 };
 
 static LogicalResult
-collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
+collectLocalSourceModules(const lython::parser::Node &module,
+                          StringRef importRoot, StringRef baseDir,
                           StringRef packageName, StringRef mainPath,
                           std::vector<ParsedLocalSourceModule> &sources,
                           std::set<std::string> &seen,
@@ -638,7 +649,8 @@ collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
                           const llvm::Triple &triple, bool hasJsHost,
                           llvm::raw_ostream &diag) {
   llvm::SmallVector<SourceImportRequest, 8> imports;
-  collectImportedModuleRequests(module, baseDir, packageName, triple, hasJsHost,
+  collectImportedModuleRequests(module, importRoot, baseDir, packageName,
+                                triple, hasJsHost,
                                 imports);
   for (const SourceImportRequest &request : imports) {
     if (llvm::StringRef(request.sourcePath) == mainPath)
@@ -725,7 +737,7 @@ collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
                                         : packageNameForModuleName(
                                               request.moduleName);
     if (failed(collectLocalSourceModules(
-            *parsed.tree, nestedBaseDir, nestedPackageName, mainPath, sources,
+            *parsed.tree, importRoot, nestedBaseDir, nestedPackageName, mainPath, sources,
             seen, visiting, releaseMode, triple, hasJsHost, diag)))
       return failure();
     visiting.erase(request.moduleName);
@@ -765,9 +777,30 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
   std::vector<ParsedLocalSourceModule> localSources;
   std::set<std::string> seenSourceModules;
   std::set<std::string> visitingSourceModules;
-  std::string mainPackageName = staticPackageNameForSourcePath(sourcePath);
+  std::string mainPackageName = driverOptions.mainPackage.empty()
+                                    ? staticPackageNameForSourcePath(sourcePath)
+                                    : driverOptions.mainPackage;
+  // `python -m pkg.mod` imports `pkg` before it runs `__main__`: collected
+  // first, it is initialized first.
+  if (!driverOptions.mainPackage.empty()) {
+    lython::parser::ParseResult packageImport = lython::parser::parse(
+        "import " + driverOptions.mainPackage + "\n", sourcePath.str(),
+        options);
+    if (!packageImport.ok()) {
+      diag << sourcePath << ": error: '" << driverOptions.mainPackage
+           << "' is not a package name\n";
+      return failure();
+    }
+    if (failed(collectLocalSourceModules(
+            *packageImport.tree, importBaseDir, importBaseDir, mainPackageName,
+            sourcePath, localSources, seenSourceModules, visitingSourceModules,
+            driverOptions.releaseMode, codeGenTripleForTarget({}, driverOptions),
+            hasJsHost, diag)))
+      return failure();
+  }
   if (failed(collectLocalSourceModules(
-          *parsed.tree, importBaseDir, mainPackageName, sourcePath,
+          *parsed.tree, importBaseDir, llvm::sys::path::parent_path(sourcePath),
+          mainPackageName, sourcePath,
           localSources, seenSourceModules, visitingSourceModules,
           driverOptions.releaseMode, codeGenTripleForTarget({}, driverOptions),
           hasJsHost, diag)))
@@ -787,7 +820,7 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
         lython::parser::parse("import io\n", sourcePath.str(), options);
     if (!ioImport.ok() ||
         failed(collectLocalSourceModules(
-            *ioImport.tree, importBaseDir, mainPackageName, sourcePath,
+            *ioImport.tree, importBaseDir, importBaseDir, mainPackageName, sourcePath,
             localSources, seenSourceModules, visitingSourceModules,
             driverOptions.releaseMode, codeGenTripleForTarget({}, driverOptions),
             hasJsHost, diag)))
@@ -811,7 +844,7 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
         lython::parser::parse("import traceback\n", sourcePath.str(), options);
     if (!tracebackImport.ok() ||
         failed(collectLocalSourceModules(
-            *tracebackImport.tree, importBaseDir, mainPackageName, sourcePath,
+            *tracebackImport.tree, importBaseDir, importBaseDir, mainPackageName, sourcePath,
             localSources, seenSourceModules, visitingSourceModules,
             driverOptions.releaseMode, codeGenTripleForTarget({}, driverOptions),
             hasJsHost, diag)))
@@ -827,7 +860,7 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
         lython::parser::parse("import _js_bridge\n", sourcePath.str(), options);
     if (!bridgeImport.ok() ||
         failed(collectLocalSourceModules(
-            *bridgeImport.tree, importBaseDir, mainPackageName, sourcePath,
+            *bridgeImport.tree, importBaseDir, importBaseDir, mainPackageName, sourcePath,
             localSources, seenSourceModules, visitingSourceModules,
             driverOptions.releaseMode, codeGenTripleForTarget({}, driverOptions),
             hasJsHost, diag)))

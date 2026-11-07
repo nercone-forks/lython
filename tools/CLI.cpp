@@ -118,6 +118,7 @@
 #include "Passes/Runtime/Arch/X86/X86.h"
 #include "Driver.h"
 #include "DriverCodeGen.h"
+#include "Project.h"
 #include "SanitizerSupport.h"
 
 #include "PyDialect.h.inc"
@@ -1343,8 +1344,9 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
 }
 } // namespace
 
-static llvm::cl::opt<std::string> InputFilename(llvm::cl::Positional,
-                                                llvm::cl::desc("<input file>"),
+static llvm::cl::opt<std::string>
+    InputFilename(llvm::cl::Positional,
+                  llvm::cl::desc("<input file or project directory>"),
                                                 llvm::cl::cat(LythonCategory));
 static llvm::cl::opt<std::string>
     OutputFilename("o", llvm::cl::desc("Output file (default: a.out)"),
@@ -1420,9 +1422,24 @@ static llvm::cl::list<std::string> SanitizerDisableOptions(
       lython::driver::recordSanitizerAction(/*enable=*/false, value);
     }),
     llvm::cl::cat(LythonCategory));
+// A project directory as the input (one with a pyproject.toml) runs one of its
+// `[project.scripts]`, or the module -m names, as an installed project would.
+static llvm::cl::opt<std::string> MainModuleOption(
+    "m",
+    llvm::cl::desc("Run this module of the project directory given as the "
+                   "input, as `python -m` does"),
+    llvm::cl::value_desc("module"), llvm::cl::init(""),
+    llvm::cl::cat(LythonCategory));
+static llvm::cl::opt<std::string> ScriptOption(
+    "script",
+    llvm::cl::desc("Run this [project.scripts] entry of the project directory "
+                   "given as the input (needed when it has several)"),
+    llvm::cl::value_desc("name"), llvm::cl::init(""),
+    llvm::cl::cat(LythonCategory));
 static llvm::cl::SubCommand JitCommand("jit", "JIT execute an input file");
 static llvm::cl::opt<std::string>
-    JitInputFilename(llvm::cl::Positional, llvm::cl::desc("<input file>"),
+    JitInputFilename(llvm::cl::Positional,
+                     llvm::cl::desc("<input file or project directory>"),
                      llvm::cl::Required, llvm::cl::sub(JitCommand));
 static llvm::cl::list<std::string>
     JitProgramArgs(llvm::cl::ConsumeAfter,
@@ -1558,7 +1575,76 @@ int main(int argc, char **argv) {
   if (jitMode && Options.sanitizers.leak)
     lython::driver::callLeakSanitizerHook("__lsan_disable");
 
-  bool isPythonInput = llvm::sys::path::extension(inputPath) == ".py";
+  // What `__main__` is: the input file, or what a project directory runs, and
+  // the sys.argv[0] it runs with.
+  std::string mainPath = inputPath;
+  std::string programName = inputPath;
+  std::optional<std::string> mainSource;
+  std::string importBaseDir = llvm::sys::path::parent_path(inputPath).str();
+  if (llvm::sys::fs::is_directory(inputPath)) {
+    if (!Project::isProjectDirectory(inputPath)) {
+      llvm::errs() << "error: '" << inputPath
+                   << "' is a directory without a pyproject.toml\n";
+      return 1;
+    }
+    std::optional<Project> project = Project::load(inputPath, llvm::errs());
+    if (!project)
+      return 1;
+    importBaseDir = project->importRoot();
+    if (!MainModuleOption.empty()) {
+      if (!ScriptOption.empty()) {
+        llvm::errs() << "error: -m and --script both name what to run; give "
+                        "one\n";
+        return 1;
+      }
+      std::optional<MainModule> main =
+          project->mainModule(MainModuleOption, llvm::errs());
+      if (!main)
+        return 1;
+      mainPath = main->sourcePath;
+      programName = mainPath;
+      Options.mainPackage = main->package;
+    } else {
+      const auto &scripts = project->scripts();
+      const EntryPoint *entry = nullptr;
+      std::string name = ScriptOption;
+      if (!name.empty()) {
+        entry = project->script(name);
+        if (!entry) {
+          llvm::errs() << "error: " << inputPath
+                       << "/pyproject.toml has no script '" << name << "'\n";
+          return 1;
+        }
+      } else if (scripts.size() == 1) {
+        name = scripts.front().first;
+        entry = &scripts.front().second;
+      } else {
+        llvm::errs() << "error: " << inputPath << "/pyproject.toml has ";
+        if (scripts.empty()) {
+          llvm::errs() << "no [project.scripts]; name a module to run with "
+                          "-m\n";
+        } else {
+          llvm::errs() << scripts.size()
+                       << " scripts; choose one with --script:";
+          for (const auto &script : scripts)
+            llvm::errs() << ' ' << script.first;
+          llvm::errs() << "\n";
+        }
+        return 1;
+      }
+      mainPath = project->scriptSourcePath(name);
+      programName = project->scriptPath(name);
+      mainSource = Project::scriptSource(*entry);
+    }
+  } else if (!MainModuleOption.empty() || !ScriptOption.empty()) {
+    llvm::errs() << "error: -m and --script choose what a project directory "
+                    "runs; '"
+                 << inputPath << "' is not a directory\n";
+    return 1;
+  }
+
+  bool isPythonInput = mainPath != inputPath ||
+                       llvm::sys::path::extension(inputPath) == ".py";
 
   DialectRegistry registry;
   lython::driver::registerLythonDialects(registry);
@@ -1576,8 +1662,17 @@ int main(int argc, char **argv) {
   OwningOpRef<ModuleOp> module;
 
   if (isPythonInput) {
-    if (failed(emitMLIRFromFile(inputPath, Options, context, module,
-                                llvm::errs())))
+    if (!mainSource) {
+      auto file = llvm::MemoryBuffer::getFile(mainPath);
+      if (!file) {
+        llvm::errs() << "error: could not open input file '" << mainPath
+                     << "'\n";
+        return 1;
+      }
+      mainSource = (*file)->getBuffer().str();
+    }
+    if (failed(emitMLIRFromSource(*mainSource, mainPath, importBaseDir,
+                                  Options, context, module, llvm::errs())))
       return 1;
   } else {
     auto file = mlir::openInputFile(inputPath);
@@ -1613,7 +1708,7 @@ int main(int argc, char **argv) {
 
   if (jitMode) {
     std::vector<std::string> programArgs;
-    programArgs.push_back(JitInputFilename);
+    programArgs.push_back(programName);
     programArgs.insert(programArgs.end(), JitProgramArgs.begin(),
                        JitProgramArgs.end());
     FailureOr<int> status = runJIT(*module, irDump, tensorTarget, programArgs);
