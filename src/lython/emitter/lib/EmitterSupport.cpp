@@ -348,9 +348,19 @@ bool containsStatementKind(const parser::Node *node,
   if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
       node->kind == "ClassDef" || node->kind == "Lambda")
     return false;
+  // A loop's own body is where its break / continue go, but its `else`
+  // clause runs after the loop and its break / continue belong to the
+  // enclosing one.
   if (stopAtLoops && (node->kind == "For" || node->kind == "AsyncFor" ||
-                      node->kind == "While"))
+                      node->kind == "While")) {
+    if (const parser::Field *orelse = parser::findField(*node, "orelse"))
+      if (const auto *children =
+              std::get_if<std::vector<parser::NodePtr>>(&orelse->value))
+        for (const parser::NodePtr &item : *children)
+          if (containsStatementKind(item.get(), kinds, stopAtLoops))
+            return true;
     return false;
+  }
   for (const parser::Field &field : node->fields) {
     if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
       if (containsStatementKind(child->get(), kinds, stopAtLoops))

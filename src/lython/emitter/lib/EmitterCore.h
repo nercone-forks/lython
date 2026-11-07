@@ -960,6 +960,18 @@ private:
   // emitted) and the lane construction (taken after), which must agree: a name
   // that neither promotes nor lanes reverts to its pre-try value silently.
   mlir::Type postTryLaneCarrierType(mlir::Type type) const;
+  // The completion lanes a py.try carries for a return / break / continue
+  // that leaves its regions: the payload a non-returning path yields, and the
+  // branches after the op that act on the flags. Shared by `try` and
+  // `try/except*`, whose try regions leave the same way.
+  Value emitTryCompletionDefault(const parser::Node &statement,
+                                 mlir::Type target);
+  bool emitTryCompletionDispatch(const parser::Node &statement,
+                                 mlir::Operation *tryOp, unsigned flagBase,
+                                 bool carriesReturnValue,
+                                 bool dispatchesReturn,
+                                 bool dispatchesLoopControl,
+                                 bool exceptCanFallThrough);
   void emitTryStar(const parser::Node &statement);
   void emitWith(const parser::Node &statement, bool async);
   void emitWithCleanup(const parser::Node &anchor, const WithCleanup &cleanup);

@@ -131,3 +131,29 @@ Python の例外がどう投げられ、どう捕まえられるか。何に費�
 - unwind 表、フレームポインタ、行テーブルは変わらない。
 - raise を止めるなら `b LyEH_ThrowException$ret` (戻り値の方式)。
 - 未着手: lldb の `ly-exc` / `ly-bt` コマンド。
+
+## 6. except* と return / break / continue
+
+- **try 本体の return / break / continue は `try` と同じ道を通る。**
+  - `py.try` の結果に完了フラグ (return / break / continue) と戻り値を載せ、
+    op の後でフラグを見て分岐する (`emitTryCompletionDispatch`)。
+  - 平の `try` と except* の両方がこの関数を使う。分岐の形が 2 つに分かれないように
+    するためである。
+- **except 領域はいつも「通り抜け」で終わる。** 節の中で return / break / continue
+  する方法がないからである (次項)。だから節には完了フラグの経路を作らない。
+- **節の中で節を抜ける return / break / continue は SyntaxError である** (PEP 654)。
+  - CPython 3.14 と同じ文言で拒否する:
+    `'break', 'continue' and 'return' cannot appear in an except* block`。
+  - 節の中に書いたループの break / continue と、節の中で定義した関数の return は
+    節を抜けないので通る (CPython と同じ)。
+  - ループの `else:` の中の break / continue は、外側のループのものとして数える
+    (`containsStatementKind`)。以前はループごと飛ばしていたので、検査をすり抜けて
+    lowering の "reference to block defined in another region" になっていた。
+    平の `try` でも同じだった。
+- `try/except*/finally` は `try: (try/except*) finally:` に組み替えてから出す。
+  本体の return は内側の except* の後で外側の `try` に渡る。
+- ⛔ 残っている制約 (以前から):
+  - 節や本体で、文の前からある局所変数に代入できない。
+  - `else` と yield は使えない。
+  - try 本体の return の型は、平の `try` が運べるもの (契約型、union、literal)
+    に限る。

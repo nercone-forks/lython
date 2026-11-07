@@ -762,6 +762,106 @@ TEST(EmitterTest, ARecursiveGeneratorTypesAndLeavesTheRefusalToTheLowering) {
         << diagnostic.message;
 }
 
+// What this pins: PEP 654's rule for an except* clause, as CPython 3.14
+// compiles it. A `return`, `break` or `continue` that would leave the clause is
+// a SyntaxError ("'break', 'continue' and 'return' cannot appear in an except*
+// block"); one that belongs to a loop or a function written inside the clause
+// leaves only that loop or function and is allowed. The same three statements
+// in the TRY BODY of the statement are ordinary Python and must emit.
+TEST(EmitterTest, ExceptStarClausesRefuseOnlyTheJumpsThatWouldLeaveThem) {
+  mlir::MLIRContext context(testRegistry());
+  const char *refused[] = {
+      "def f() -> int:\n"
+      "    try:\n"
+      "        pass\n"
+      "    except* ValueError:\n"
+      "        return 1\n"
+      "    return 0\n",
+      "for i in range(3):\n"
+      "    try:\n"
+      "        pass\n"
+      "    except* ValueError:\n"
+      "        break\n",
+      "for i in range(3):\n"
+      "    try:\n"
+      "        pass\n"
+      "    except* ValueError:\n"
+      "        if i == 1:\n"
+      "            continue\n",
+      // A loop's `else` runs after the loop, so its break is the clause's.
+      "for i in range(3):\n"
+      "    try:\n"
+      "        pass\n"
+      "    except* ValueError:\n"
+      "        for j in range(2):\n"
+      "            pass\n"
+      "        else:\n"
+      "            break\n",
+  };
+  for (const char *source : refused) {
+    lython::emitter::EmitResult emitted = emitSource(source, context);
+    EXPECT_FALSE(emitted.ok()) << source;
+    EXPECT_TRUE(reportsDiagnostic(
+        emitted,
+        "'break', 'continue' and 'return' cannot appear in an except* block"))
+        << source;
+  }
+
+  const char *allowed[] = {
+      "try:\n"
+      "    pass\n"
+      "except* ValueError:\n"
+      "    for k in range(3):\n"
+      "        if k == 1:\n"
+      "            break\n"
+      "        continue\n",
+      "try:\n"
+      "    pass\n"
+      "except* ValueError:\n"
+      "    def g() -> int:\n"
+      "        return 1\n"
+      "    print(g())\n",
+      "def f(n: int) -> int:\n"
+      "    try:\n"
+      "        if n > 0:\n"
+      "            return n\n"
+      "    except* ValueError:\n"
+      "        pass\n"
+      "    return 0\n",
+      // The literal return types a plain `try` carries.
+      "from typing import Literal\n"
+      "def lit(n: int) -> Literal[3]:\n"
+      "    try:\n"
+      "        if n > 0:\n"
+      "            return 3\n"
+      "    except* ValueError:\n"
+      "        pass\n"
+      "    return 3\n",
+      "for i in range(3):\n"
+      "    try:\n"
+      "        if i == 0:\n"
+      "            continue\n"
+      "        break\n"
+      "    except* ValueError:\n"
+      "        pass\n",
+  };
+  for (const char *source : allowed) {
+    lython::emitter::EmitResult emitted = emitSource(source, context);
+    EXPECT_TRUE(emitted.ok()) << source;
+  }
+
+  // At module level there is no function to return from (CPython: "'return'
+  // outside function").
+  lython::emitter::EmitResult outside = emitSource(
+      "try:\n"
+      "    return\n"
+      "except* ValueError:\n"
+      "    pass\n",
+      context);
+  EXPECT_FALSE(outside.ok());
+  EXPECT_TRUE(reportsDiagnostic(outside, "'return' outside function"));
+}
+
 TEST(EmitterTest, ExceptStarAndYieldAreEachStillFineApart) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult star = emitSource(

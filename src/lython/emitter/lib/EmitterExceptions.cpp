@@ -895,112 +895,8 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
     yieldValues.push_back(mlir::arith::ConstantIntOp::create(
         builder, loc(statement), value ? 1 : 0, 1));
   };
-  std::function<Value(mlir::Type)> emitDefaultReturnValue;
-  emitDefaultReturnValue = [&](mlir::Type target) -> Value {
-    if (auto literal = mlir::dyn_cast<py::LiteralType>(target)) {
-      llvm::StringRef spelling = literal.getSpelling();
-      if (spelling == "None") {
-        auto op = py::NoneOp::create(builder, loc(statement), target);
-        return {op.getResult(), target};
-      }
-      if (spelling == "True" || spelling == "False") {
-        auto op =
-            py::BoolConstantOp::create(builder, loc(statement), target,
-                                       builder.getBoolAttr(spelling == "True"));
-        return {op.getResult(), target};
-      }
-      if (isIntegerLiteralSpelling(spelling)) {
-        auto op = py::IntConstantOp::create(builder, loc(statement), target,
-                                            builder.getStringAttr(spelling));
-        return {op.getResult(), target};
-      }
-      if (spelling.size() >= 2 && spelling.front() == '"' &&
-          spelling.back() == '"') {
-        auto op = py::StrConstantOp::create(
-            builder, loc(statement), target,
-            builder.getStringAttr(spelling.drop_front().drop_back()));
-        return {op.getResult(), target};
-      }
-    }
-    // The None member the carrier check found: wrapped into the union, which
-    // is what an ordinary `x: int | None = None` already emits.
-    //
-    // A union with no None member takes its first member's default. Without
-    // a finally nobody reads it -- the try region's payload on a path that
-    // fell through -- but a None there is no member at all, and `try: return
-    // int(s)` / `except ValueError: pass` / `return s` was refused by the
-    // union injection for `-> int | str`.
-    if (auto unionType = mlir::dyn_cast<py::UnionType>(target)) {
-      if (isSupportedFinallyReturnCarrierType(unionType) ||
-          unionType.getMemberTypes().empty())
-        return coerceValue(emitNone(statement), target, statement);
-      return coerceValue(
-          emitDefaultReturnValue(unionType.getMemberTypes().front()), target,
-          statement);
-    }
-    if (auto contract = mlir::dyn_cast<py::ContractType>(target)) {
-      llvm::StringRef name = contract.getContractName();
-      if (name == "types.NoneType" || name == "builtins.object") {
-        Value value = emitNone(statement);
-        return coerceValue(value, target, statement);
-      }
-      if (name == "builtins.bool") {
-        mlir::Type literalType = types.literal("False");
-        Value value{py::BoolConstantOp::create(builder, loc(statement),
-                                               literalType,
-                                               builder.getBoolAttr(false))
-                        .getResult(),
-                    literalType};
-        return coerceValue(value, target, statement);
-      }
-      if (name == "builtins.int") {
-        mlir::Type literalType = types.literal("0");
-        Value value{py::IntConstantOp::create(builder, loc(statement),
-                                              literalType,
-                                              builder.getStringAttr("0"))
-                        .getResult(),
-                    literalType};
-        return coerceValue(value, target, statement);
-      }
-      if (name == "builtins.float") {
-        auto op = py::FloatConstantOp::create(builder, loc(statement), target,
-                                              builder.getF64FloatAttr(0.0));
-        return {op.getResult(), target};
-      }
-      if (name == "builtins.str") {
-        mlir::Type literalType = types.literal("\"\"");
-        Value value{py::StrConstantOp::create(builder, loc(statement),
-                                              literalType,
-                                              builder.getStringAttr(""))
-                        .getResult(),
-                    literalType};
-        return coerceValue(value, target, statement);
-      }
-      // ⭐ AN EMPTY CONTAINER, the same default `defaultCompletionValue`
-      // synthesizes in the lowering. Falling through to `emitNone` below gave
-      // the payload lane a None where a list was expected, and the report was
-      // about the ABI ("cannot adapt runtime bundle types.NoneType with
-      // physical values () to expected ABI (memref<9xi64>)") rather than about
-      // the program -- for `with open(...) as f: return [x]`, which is what a
-      // `with` desugars into.
-      if (name == "builtins.list" || name == "builtins.tuple" ||
-          name == "builtins.set" || name == "builtins.frozenset" ||
-          name == "builtins.dict" || name == "builtins.bytes") {
-        auto op = py::PackOp::create(builder, loc(statement), target,
-                                     mlir::ValueRange{});
-        return {op.getResult(), target};
-      }
-      // ⭐ AND ANYTHING ELSE IS THE UNBOUND PLACEHOLDER, which is what this
-      // value IS: the payload on the path that did not return, never read
-      // (the return flag beside it is false) and only ever released. `py.
-      // unbound` lowers to the non-owning dead object the cell machinery
-      // already uses, so `with lock: return Result(...)` -- a SOURCE class,
-      // which has no literal to default to -- stops being "return value type
-      // through try/finally is not implemented yet".
-      auto unbound = py::UnboundOp::create(builder, loc(statement), target);
-      return {unbound.getResult(), target};
-    }
-    return emitNone(statement);
+  auto emitDefaultReturnValue = [&](mlir::Type target) {
+    return emitTryCompletionDefault(statement, target);
   };
   auto appendFallthroughReturnPayload =
       [&](llvm::SmallVectorImpl<mlir::Value> &yieldValues) {
@@ -1699,154 +1595,13 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
         Value{tryOp.getResult(static_cast<unsigned>(index)), local.type};
     bindStoredLocalType(local.name, local.type);
   }
-  if (usesFinallyCompletion) {
-    const unsigned flagBase = hasElse ? 1u : 0u;
-    const unsigned returnFlagIndex = flagBase;
-    const unsigned breakFlagIndex = flagBase + 1;
-    const unsigned continueFlagIndex = flagBase + 2;
-    const unsigned returnPayloadIndex = flagBase + 3;
-    auto emitReturnCompletion = [&]() {
-      Value returned =
-          supportsValueReturnThroughFinally
-              ? Value{tryOp.getResult(returnPayloadIndex), currentReturnType}
-              : emitNone(statement);
-      if (!inlineReturnContexts.empty()) {
-        InlineReturnContext &ctx = inlineReturnContexts.back();
-        if (ctx.endsFrame)
-          emitFrameExitKeepAlives(statement);
-        if (ctx.carryResult) {
-          Value result = ctx.resultType
-                             ? coerceValue(returned, ctx.resultType, statement)
-                             : returned;
-          mlir::cf::BranchOp::create(builder, loc(statement), ctx.target,
-                                     result.value);
-        } else {
-          mlir::cf::BranchOp::create(builder, loc(statement), ctx.target);
-        }
-      } else {
-        emitFrameExitKeepAlives(statement);
-        Value result = coerceValue(returned, currentReturnType, statement);
-        mlir::func::ReturnOp::create(builder, loc(statement), result.value);
-      }
-    };
-    auto discardInactiveReturnPayload = [&]() {
-      if (supportsValueReturnThroughFinally &&
-          mlir::isa<py::ContractType>(currentReturnType))
-        py::DecRefOp::create(builder, loc(statement),
-                             tryOp.getResult(returnPayloadIndex));
-    };
-    bool canFallThrough = false;
-    if (auto attr = tryOp->getAttrOfType<mlir::BoolAttr>(
-            "ly.try.source_can_fallthrough"))
-      canFallThrough = attr.getValue();
-    canFallThrough = canFallThrough || exceptCanFallThrough;
-    mlir::Value returnFlag = tryOp.getResult(returnFlagIndex);
-    mlir::Value breakFlag = tryOp.getResult(breakFlagIndex);
-    mlir::Value continueFlag = tryOp.getResult(continueFlagIndex);
-    if (!canFallThrough && supportsReturnThroughFinally &&
-        !supportsLoopControlThroughFinally) {
-      emitReturnCompletion();
-      return;
-    }
-
-    mlir::Block *tryBlock = tryOp->getBlock();
-    mlir::Block *afterCompletionCheck =
-        tryBlock->splitBlock(builder.getInsertionPoint());
-    mlir::Block *afterReturnCheck = tryBlock;
-    builder.setInsertionPointToEnd(tryBlock);
-    if (supportsReturnThroughFinally) {
-      mlir::Block *returnBlock = new mlir::Block;
-      afterReturnCheck = new mlir::Block;
-      tryBlock->getParent()->getBlocks().insert(
-          afterCompletionCheck->getIterator(), returnBlock);
-      tryBlock->getParent()->getBlocks().insert(
-          afterCompletionCheck->getIterator(), afterReturnCheck);
-      mlir::cf::CondBranchOp::create(builder, loc(statement), returnFlag,
-                                     returnBlock, mlir::ValueRange{},
-                                     afterReturnCheck, mlir::ValueRange{});
-
-      builder.setInsertionPointToStart(returnBlock);
-      emitReturnCompletion();
-      builder.setInsertionPointToStart(afterReturnCheck);
-    }
-    if (supportsLoopControlThroughFinally) {
-      mlir::Block *breakBlock = new mlir::Block;
-      mlir::Block *afterBreakCheck = new mlir::Block;
-      mlir::Block *continueBlock = new mlir::Block;
-      mlir::Block *afterContinueCheck = new mlir::Block;
-      tryBlock->getParent()->getBlocks().insert(
-          afterCompletionCheck->getIterator(), breakBlock);
-      tryBlock->getParent()->getBlocks().insert(
-          afterCompletionCheck->getIterator(), afterBreakCheck);
-      tryBlock->getParent()->getBlocks().insert(
-          afterCompletionCheck->getIterator(), continueBlock);
-      tryBlock->getParent()->getBlocks().insert(
-          afterCompletionCheck->getIterator(), afterContinueCheck);
-
-      mlir::cf::CondBranchOp::create(builder, loc(statement), breakFlag,
-                                     breakBlock, mlir::ValueRange{},
-                                     afterBreakCheck, mlir::ValueRange{});
-
-      // ⭐ THE CELL, not the pre-try SSA value. While the promotion stands a
-      // carried name resolves to its cell, so the operands this edge owes the
-      // loop are loads emitted in THIS block -- which is what makes
-      // `total += int(s)` inside a try with `except: continue` representable at
-      // all. The binding is put back afterwards because the statement is not
-      // over: the else body and the finally dispatch still read through the cell.
-      auto carriedCompletionOperands =
-          [&](mlir::Block *target) -> llvm::SmallVector<mlir::Value, 4> {
-        // ⛔ Asked of the TARGET, not of the carried set. Both completion checks
-        // are emitted whenever either jump appears, so a `continue`-only
-        // statement still gets a break branch -- and a loop with no `break`
-        // gives its after-block no arguments (`breakForwardsCarried`). Forwarding
-        // the carried set there was "branch has 1 operands for successor #0, but
-        // target block has 0". The branch is dead, so emitting no operands and no
-        // refcount traffic for it is also the honest shape.
-        if (!target || target->getNumArguments() == 0)
-          return {};
-        const LoopControlContext &loop = loopControlContexts.back();
-        llvm::SmallVector<std::pair<std::string, Value>, 4> restore;
-        for (const CarriedLoopLocal &carried : loop.carriedLocals) {
-          auto bound = values.find(carried.name);
-          if (bound == values.end() || !isCellContract(bound->second.type))
-            continue;
-          restore.emplace_back(carried.name, bound->second);
-          values[carried.name] = emitCellLoad(statement, bound->second);
-        }
-        llvm::SmallVector<mlir::Value, 4> operands =
-            loopCarriedBranchOperands(statement, loop, target);
-        for (const auto &entry : restore)
-          values[entry.first] = entry.second;
-        return operands;
-      };
-
-      builder.setInsertionPointToStart(breakBlock);
-      discardInactiveReturnPayload();
-      {
-        mlir::Block *target = loopControlContexts.back().breakTarget;
-        mlir::cf::BranchOp::create(builder, loc(statement), target,
-                                   carriedCompletionOperands(target));
-      }
-
-      builder.setInsertionPointToStart(afterBreakCheck);
-      mlir::cf::CondBranchOp::create(builder, loc(statement), continueFlag,
-                                     continueBlock, mlir::ValueRange{},
-                                     afterContinueCheck, mlir::ValueRange{});
-
-      builder.setInsertionPointToStart(continueBlock);
-      discardInactiveReturnPayload();
-      {
-        mlir::Block *target = loopControlContexts.back().continueTarget;
-        mlir::cf::BranchOp::create(builder, loc(statement), target,
-                                   carriedCompletionOperands(target));
-      }
-
-      builder.setInsertionPointToStart(afterContinueCheck);
-    }
-    discardInactiveReturnPayload();
-    mlir::cf::BranchOp::create(builder, loc(statement), afterCompletionCheck);
-    builder.setInsertionPointToStart(afterCompletionCheck);
-  }
+  if (usesFinallyCompletion &&
+      emitTryCompletionDispatch(statement, tryOp, hasElse ? 1u : 0u,
+                                supportsValueReturnThroughFinally,
+                                supportsReturnThroughFinally,
+                                supportsLoopControlThroughFinally,
+                                exceptCanFallThrough))
+    return;
   if (hasElse) {
     mlir::Block *dispatchBlock = builder.getInsertionBlock();
     mlir::Block *afterElseBlock =
@@ -1916,6 +1671,272 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
 }
 
 
+// The payload a completion lane carries on a path that did not return: never
+// read (the return flag beside it is false) and only ever released.
+Value ModuleEmitter::emitTryCompletionDefault(const parser::Node &statement,
+                                              mlir::Type target) {
+  if (auto literal = mlir::dyn_cast<py::LiteralType>(target)) {
+    llvm::StringRef spelling = literal.getSpelling();
+    if (spelling == "None") {
+      auto op = py::NoneOp::create(builder, loc(statement), target);
+      return {op.getResult(), target};
+    }
+    if (spelling == "True" || spelling == "False") {
+      auto op =
+          py::BoolConstantOp::create(builder, loc(statement), target,
+                                     builder.getBoolAttr(spelling == "True"));
+      return {op.getResult(), target};
+    }
+    if (isIntegerLiteralSpelling(spelling)) {
+      auto op = py::IntConstantOp::create(builder, loc(statement), target,
+                                          builder.getStringAttr(spelling));
+      return {op.getResult(), target};
+    }
+    if (spelling.size() >= 2 && spelling.front() == '"' &&
+        spelling.back() == '"') {
+      auto op = py::StrConstantOp::create(
+          builder, loc(statement), target,
+          builder.getStringAttr(spelling.drop_front().drop_back()));
+      return {op.getResult(), target};
+    }
+  }
+  // The None member the carrier check found: wrapped into the union, which
+  // is what an ordinary `x: int | None = None` already emits.
+  //
+  // A union with no None member takes its first member's default. Without
+  // a finally nobody reads it -- the try region's payload on a path that
+  // fell through -- but a None there is no member at all, and `try: return
+  // int(s)` / `except ValueError: pass` / `return s` was refused by the
+  // union injection for `-> int | str`.
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(target)) {
+    if (isSupportedFinallyReturnCarrierType(unionType) ||
+        unionType.getMemberTypes().empty())
+      return coerceValue(emitNone(statement), target, statement);
+    return coerceValue(
+        emitTryCompletionDefault(statement, unionType.getMemberTypes().front()), target,
+        statement);
+  }
+  if (auto contract = mlir::dyn_cast<py::ContractType>(target)) {
+    llvm::StringRef name = contract.getContractName();
+    if (name == "types.NoneType" || name == "builtins.object") {
+      Value value = emitNone(statement);
+      return coerceValue(value, target, statement);
+    }
+    if (name == "builtins.bool") {
+      mlir::Type literalType = types.literal("False");
+      Value value{py::BoolConstantOp::create(builder, loc(statement),
+                                             literalType,
+                                             builder.getBoolAttr(false))
+                      .getResult(),
+                  literalType};
+      return coerceValue(value, target, statement);
+    }
+    if (name == "builtins.int") {
+      mlir::Type literalType = types.literal("0");
+      Value value{py::IntConstantOp::create(builder, loc(statement),
+                                            literalType,
+                                            builder.getStringAttr("0"))
+                      .getResult(),
+                  literalType};
+      return coerceValue(value, target, statement);
+    }
+    if (name == "builtins.float") {
+      auto op = py::FloatConstantOp::create(builder, loc(statement), target,
+                                            builder.getF64FloatAttr(0.0));
+      return {op.getResult(), target};
+    }
+    if (name == "builtins.str") {
+      mlir::Type literalType = types.literal("\"\"");
+      Value value{py::StrConstantOp::create(builder, loc(statement),
+                                            literalType,
+                                            builder.getStringAttr(""))
+                      .getResult(),
+                  literalType};
+      return coerceValue(value, target, statement);
+    }
+    // ⭐ AN EMPTY CONTAINER, the same default `defaultCompletionValue`
+    // synthesizes in the lowering. Falling through to `emitNone` below gave
+    // the payload lane a None where a list was expected, and the report was
+    // about the ABI ("cannot adapt runtime bundle types.NoneType with
+    // physical values () to expected ABI (memref<9xi64>)") rather than about
+    // the program -- for `with open(...) as f: return [x]`, which is what a
+    // `with` desugars into.
+    if (name == "builtins.list" || name == "builtins.tuple" ||
+        name == "builtins.set" || name == "builtins.frozenset" ||
+        name == "builtins.dict" || name == "builtins.bytes") {
+      auto op = py::PackOp::create(builder, loc(statement), target,
+                                   mlir::ValueRange{});
+      return {op.getResult(), target};
+    }
+    // ⭐ AND ANYTHING ELSE IS THE UNBOUND PLACEHOLDER, which is what this
+    // value IS: the payload on the path that did not return, never read
+    // (the return flag beside it is false) and only ever released. `py.
+    // unbound` lowers to the non-owning dead object the cell machinery
+    // already uses, so `with lock: return Result(...)` -- a SOURCE class,
+    // which has no literal to default to -- stops being "return value type
+    // through try/finally is not implemented yet".
+    auto unbound = py::UnboundOp::create(builder, loc(statement), target);
+    return {unbound.getResult(), target};
+  }
+  return emitNone(statement);
+}
+
+// The branches after a py.try whose results carry the completion flags
+// (return / break / continue, then the return payload) starting at
+// `flagBase`. True when nothing falls through to the continuation.
+bool ModuleEmitter::emitTryCompletionDispatch(
+    const parser::Node &statement, mlir::Operation *rawTryOp,
+    unsigned flagBase, bool carriesReturnValue, bool dispatchesReturn,
+    bool dispatchesLoopControl, bool exceptCanFallThrough) {
+  auto tryOp = mlir::cast<py::TryOp>(rawTryOp);
+  const unsigned returnFlagIndex = flagBase;
+  const unsigned breakFlagIndex = flagBase + 1;
+  const unsigned continueFlagIndex = flagBase + 2;
+  const unsigned returnPayloadIndex = flagBase + 3;
+  auto emitReturnCompletion = [&]() {
+    Value returned =
+        carriesReturnValue
+            ? Value{tryOp.getResult(returnPayloadIndex), currentReturnType}
+            : emitNone(statement);
+    if (!inlineReturnContexts.empty()) {
+      InlineReturnContext &ctx = inlineReturnContexts.back();
+      if (ctx.endsFrame)
+        emitFrameExitKeepAlives(statement);
+      if (ctx.carryResult) {
+        Value result = ctx.resultType
+                           ? coerceValue(returned, ctx.resultType, statement)
+                           : returned;
+        mlir::cf::BranchOp::create(builder, loc(statement), ctx.target,
+                                   result.value);
+      } else {
+        mlir::cf::BranchOp::create(builder, loc(statement), ctx.target);
+      }
+    } else {
+      emitFrameExitKeepAlives(statement);
+      Value result = coerceValue(returned, currentReturnType, statement);
+      mlir::func::ReturnOp::create(builder, loc(statement), result.value);
+    }
+  };
+  auto discardInactiveReturnPayload = [&]() {
+    if (carriesReturnValue &&
+        mlir::isa<py::ContractType>(currentReturnType))
+      py::DecRefOp::create(builder, loc(statement),
+                           tryOp.getResult(returnPayloadIndex));
+  };
+  bool canFallThrough = false;
+  if (auto attr = tryOp->getAttrOfType<mlir::BoolAttr>(
+          "ly.try.source_can_fallthrough"))
+    canFallThrough = attr.getValue();
+  canFallThrough = canFallThrough || exceptCanFallThrough;
+  mlir::Value returnFlag = tryOp.getResult(returnFlagIndex);
+  mlir::Value breakFlag = tryOp.getResult(breakFlagIndex);
+  mlir::Value continueFlag = tryOp.getResult(continueFlagIndex);
+  if (!canFallThrough && dispatchesReturn &&
+      !dispatchesLoopControl) {
+    emitReturnCompletion();
+    return true;
+  }
+
+  mlir::Block *tryBlock = tryOp->getBlock();
+  mlir::Block *afterCompletionCheck =
+      tryBlock->splitBlock(builder.getInsertionPoint());
+  mlir::Block *afterReturnCheck = tryBlock;
+  builder.setInsertionPointToEnd(tryBlock);
+  if (dispatchesReturn) {
+    mlir::Block *returnBlock = new mlir::Block;
+    afterReturnCheck = new mlir::Block;
+    tryBlock->getParent()->getBlocks().insert(
+        afterCompletionCheck->getIterator(), returnBlock);
+    tryBlock->getParent()->getBlocks().insert(
+        afterCompletionCheck->getIterator(), afterReturnCheck);
+    mlir::cf::CondBranchOp::create(builder, loc(statement), returnFlag,
+                                   returnBlock, mlir::ValueRange{},
+                                   afterReturnCheck, mlir::ValueRange{});
+
+    builder.setInsertionPointToStart(returnBlock);
+    emitReturnCompletion();
+    builder.setInsertionPointToStart(afterReturnCheck);
+  }
+  if (dispatchesLoopControl) {
+    mlir::Block *breakBlock = new mlir::Block;
+    mlir::Block *afterBreakCheck = new mlir::Block;
+    mlir::Block *continueBlock = new mlir::Block;
+    mlir::Block *afterContinueCheck = new mlir::Block;
+    tryBlock->getParent()->getBlocks().insert(
+        afterCompletionCheck->getIterator(), breakBlock);
+    tryBlock->getParent()->getBlocks().insert(
+        afterCompletionCheck->getIterator(), afterBreakCheck);
+    tryBlock->getParent()->getBlocks().insert(
+        afterCompletionCheck->getIterator(), continueBlock);
+    tryBlock->getParent()->getBlocks().insert(
+        afterCompletionCheck->getIterator(), afterContinueCheck);
+
+    mlir::cf::CondBranchOp::create(builder, loc(statement), breakFlag,
+                                   breakBlock, mlir::ValueRange{},
+                                   afterBreakCheck, mlir::ValueRange{});
+
+    // ⭐ THE CELL, not the pre-try SSA value. While the promotion stands a
+    // carried name resolves to its cell, so the operands this edge owes the
+    // loop are loads emitted in THIS block -- which is what makes
+    // `total += int(s)` inside a try with `except: continue` representable at
+    // all. The binding is put back afterwards because the statement is not
+    // over: the else body and the finally dispatch still read through the cell.
+    auto carriedCompletionOperands =
+        [&](mlir::Block *target) -> llvm::SmallVector<mlir::Value, 4> {
+      // ⛔ Asked of the TARGET, not of the carried set. Both completion checks
+      // are emitted whenever either jump appears, so a `continue`-only
+      // statement still gets a break branch -- and a loop with no `break`
+      // gives its after-block no arguments (`breakForwardsCarried`). Forwarding
+      // the carried set there was "branch has 1 operands for successor #0, but
+      // target block has 0". The branch is dead, so emitting no operands and no
+      // refcount traffic for it is also the honest shape.
+      if (!target || target->getNumArguments() == 0)
+        return {};
+      const LoopControlContext &loop = loopControlContexts.back();
+      llvm::SmallVector<std::pair<std::string, Value>, 4> restore;
+      for (const CarriedLoopLocal &carried : loop.carriedLocals) {
+        auto bound = values.find(carried.name);
+        if (bound == values.end() || !isCellContract(bound->second.type))
+          continue;
+        restore.emplace_back(carried.name, bound->second);
+        values[carried.name] = emitCellLoad(statement, bound->second);
+      }
+      llvm::SmallVector<mlir::Value, 4> operands =
+          loopCarriedBranchOperands(statement, loop, target);
+      for (const auto &entry : restore)
+        values[entry.first] = entry.second;
+      return operands;
+    };
+
+    builder.setInsertionPointToStart(breakBlock);
+    discardInactiveReturnPayload();
+    {
+      mlir::Block *target = loopControlContexts.back().breakTarget;
+      mlir::cf::BranchOp::create(builder, loc(statement), target,
+                                 carriedCompletionOperands(target));
+    }
+
+    builder.setInsertionPointToStart(afterBreakCheck);
+    mlir::cf::CondBranchOp::create(builder, loc(statement), continueFlag,
+                                   continueBlock, mlir::ValueRange{},
+                                   afterContinueCheck, mlir::ValueRange{});
+
+    builder.setInsertionPointToStart(continueBlock);
+    discardInactiveReturnPayload();
+    {
+      mlir::Block *target = loopControlContexts.back().continueTarget;
+      mlir::cf::BranchOp::create(builder, loc(statement), target,
+                                 carriedCompletionOperands(target));
+    }
+
+    builder.setInsertionPointToStart(afterContinueCheck);
+  }
+  discardInactiveReturnPayload();
+  mlir::cf::BranchOp::create(builder, loc(statement), afterCompletionCheck);
+  builder.setInsertionPointToStart(afterCompletionCheck);
+  return false;
+}
+
 // except* (PEP 654). The emitted except region differs fundamentally from
 // the regular form: clauses are not mutually exclusive (each may consume a
 // slice of one exception group), every clause body is wrapped in an inner
@@ -1978,12 +1999,44 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
                            "except* requires at least one handler"});
     return;
   }
-  if (containsReturnStatement(ast::nodeList(statement, "body")) ||
-      containsBreakOrContinueStatement(ast::nodeList(statement, "body"))) {
+  // A return / break / continue in the try body leaves through the same
+  // completion lanes `try` uses (flags and payload on the py.try results,
+  // dispatched after the op). Only the try region can take them: CPython
+  // refuses all three in an except* clause (checked per handler below), so
+  // the except region always completes by falling through.
+  const auto *body = ast::nodeList(statement, "body");
+  bool bodyHasReturn = containsReturnStatement(body);
+  bool bodyHasLoopControl = containsBreakOrContinueStatement(body);
+  if (bodyHasReturn && !currentReturnType) {
+    diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                             statement.range.start,
+                                             "'return' outside function"});
+    return;
+  }
+  bool carriesReturnValue =
+      bodyHasReturn && currentReturnType != types.none();
+  bool usesCompletion = bodyHasReturn || bodyHasLoopControl;
+  // The carriers `try` without a finally accepts (supportsValueReturn-
+  // ThroughFinally in emitTry).
+  if (carriesReturnValue &&
+      !isSupportedFinallyReturnCarrierType(currentReturnType) &&
+      !mlir::isa<py::ContractType, py::UnionType>(currentReturnType)) {
+    std::string typeText;
+    {
+      llvm::raw_string_ostream stream(typeText);
+      stream << currentReturnType;
+    }
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, statement.range.start,
-        "return/break/continue inside a try with except* is not implemented "
-        "yet"});
+        "return of a " + typeText +
+            " value inside a try with except* is not implemented yet"});
+    return;
+  }
+  if (bodyHasLoopControl && loopControlContexts.empty()) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start,
+        "break/continue inside a try with except* requires an enclosing "
+        "supported loop"});
     return;
   }
   // The star-frame regions run in isolated emitter scopes (unlike plain
@@ -2052,12 +2105,13 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
           "except* with a tuple of exception types is not implemented yet"});
       return;
     }
-    // PEP 654: continue/break/return are a SyntaxError inside except*.
+    // PEP 654: continue/break/return are a SyntaxError inside except*,
+    // unless they belong to a loop or a function nested in the clause.
     if (containsReturnStatement(ast::nodeList(handler, "body")) ||
         containsBreakOrContinueStatement(ast::nodeList(handler, "body"))) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, handler.range.start,
-          "'return', 'break' and 'continue' are not allowed in an except* "
+          "'break', 'continue' and 'return' cannot appear in an except* "
           "block"});
       return;
     }
@@ -2079,6 +2133,13 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
   }
 
   mlir::OperationState state(loc(statement), py::TryOp::getOperationName());
+  if (usesCompletion) {
+    state.addTypes(builder.getI1Type());
+    state.addTypes(builder.getI1Type());
+    state.addTypes(builder.getI1Type());
+    if (carriesReturnValue)
+      state.addTypes(currentReturnType);
+  }
   state.addRegion();
   state.addRegion();
   state.addRegion();
@@ -2089,17 +2150,84 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
   if (exceptHandlerDepth != 0)
     tryOp->setAttr("ly.try.inside_handler", builder.getUnitAttr());
 
+  // The completion lanes, in the order emitTryCompletionDispatch reads them:
+  // return, break, continue, then the payload.
+  auto appendCompletionYield =
+      [&](llvm::SmallVectorImpl<mlir::Value> &yieldValues,
+          FinallyCompletion completion) {
+        if (!usesCompletion)
+          return;
+        for (FinallyCompletion flag :
+             {FinallyCompletion::Return, FinallyCompletion::Break,
+              FinallyCompletion::Continue})
+          yieldValues.push_back(mlir::arith::ConstantIntOp::create(
+              builder, loc(statement), completion == flag ? 1 : 0, 1));
+        if (carriesReturnValue && completion != FinallyCompletion::Return)
+          yieldValues.push_back(
+              emitTryCompletionDefault(statement, currentReturnType).value);
+      };
+
   {
     mlir::OpBuilder::InsertionGuard guard(builder);
     auto *tryBlock = new mlir::Block;
     tryOp.getTryRegion().push_back(tryBlock);
+    mlir::Block *returnBlock = nullptr;
+    mlir::Block *breakBlock = nullptr;
+    mlir::Block *continueBlock = nullptr;
+    if (bodyHasReturn) {
+      returnBlock = new mlir::Block;
+      if (carriesReturnValue)
+        returnBlock->addArgument(currentReturnType, loc(statement));
+      tryOp.getTryRegion().push_back(returnBlock);
+    }
+    if (bodyHasLoopControl) {
+      breakBlock = new mlir::Block;
+      continueBlock = new mlir::Block;
+      tryOp.getTryRegion().push_back(breakBlock);
+      tryOp.getTryRegion().push_back(continueBlock);
+    }
     builder.setInsertionPointToStart(tryBlock);
     {
       ScopedEmitterScope scope(values, types);
-      emitStatements(ast::nodeList(statement, "body"));
+      if (returnBlock)
+        inlineReturnContexts.push_back(InlineReturnContext{
+            returnBlock, currentReturnType, carriesReturnValue});
+      if (bodyHasLoopControl)
+        loopControlContexts.push_back(
+            LoopControlContext{breakBlock, continueBlock});
+      emitStatements(body);
+      if (bodyHasLoopControl)
+        loopControlContexts.pop_back();
+      if (returnBlock)
+        inlineReturnContexts.pop_back();
     }
-    terminateOpenRegionBlocks<py::TryYieldOp>(builder, loc(statement),
-                                              tryOp.getTryRegion());
+    if (returnBlock) {
+      builder.setInsertionPointToStart(returnBlock);
+      llvm::SmallVector<mlir::Value, 4> yieldValues;
+      appendCompletionYield(yieldValues, FinallyCompletion::Return);
+      if (carriesReturnValue)
+        yieldValues.push_back(returnBlock->getArgument(0));
+      py::TryYieldOp::create(builder, loc(statement), yieldValues);
+    }
+    if (breakBlock) {
+      builder.setInsertionPointToStart(breakBlock);
+      llvm::SmallVector<mlir::Value, 4> yieldValues;
+      appendCompletionYield(yieldValues, FinallyCompletion::Break);
+      py::TryYieldOp::create(builder, loc(statement), yieldValues);
+      builder.setInsertionPointToStart(continueBlock);
+      yieldValues.clear();
+      appendCompletionYield(yieldValues, FinallyCompletion::Continue);
+      py::TryYieldOp::create(builder, loc(statement), yieldValues);
+    }
+    bool tryCanFallThrough =
+        terminateOpenRegionBlocks<py::TryYieldOp>(
+            builder, loc(statement), tryOp.getTryRegion(),
+            [&](llvm::SmallVectorImpl<mlir::Value> &yieldValues) {
+              appendCompletionYield(yieldValues,
+                                    FinallyCompletion::Fallthrough);
+            }) > 0;
+    tryOp->setAttr("ly.try.source_can_fallthrough",
+                   builder.getBoolAttr(tryCanFallThrough));
   }
 
   {
@@ -2209,10 +2337,17 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
       finishState.addOperands(starFrame);
       builder.create(finishState);
     }
-    py::ExceptYieldOp::create(builder, loc(statement), mlir::ValueRange{});
+    llvm::SmallVector<mlir::Value, 4> yieldValues;
+    appendCompletionYield(yieldValues, FinallyCompletion::Fallthrough);
+    py::ExceptYieldOp::create(builder, loc(statement), yieldValues);
   }
 
   builder.setInsertionPointAfter(tryOp);
+  if (usesCompletion)
+    emitTryCompletionDispatch(statement, tryOp, /*flagBase=*/0,
+                              carriesReturnValue, bodyHasReturn,
+                              bodyHasLoopControl,
+                              /*exceptCanFallThrough=*/true);
 }
 
 // ⭐ `sys.exc_info()` IS THE EXCEPTION THE ENCLOSING `except` HANDLES: its
